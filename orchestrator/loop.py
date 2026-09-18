@@ -93,21 +93,15 @@ class Pipeline:
             await progress(f"Stage {len(status.completed) - 1}/10: {name} complete")
 
     async def _research(self, evidence: dict) -> None:
-        if not self.client:
-            return
         seat = CreativeStrategist(client=self.client, model=self.model)
         await asyncio.to_thread(seat.mining_pass, evidence)
 
     async def _concepts(self, evidence: dict) -> None:
-        if not self.client:
-            return
         seat = CreativeDirectorA(client=self.client, model=self.model)
         await asyncio.to_thread(seat.concept_portfolio, evidence)
 
     async def _psych_review(self, evidence: dict) -> None:
         assert_isolated_evidence(evidence)
-        if not self.client:
-            return
         seat = EcommercePsychologist(client=self.client, model=self.model)
         await asyncio.to_thread(seat.psych_review, evidence)
 

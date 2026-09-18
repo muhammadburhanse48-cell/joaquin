@@ -34,6 +34,9 @@ class BaseSeat:
 
     @staticmethod
     def _create_client() -> Any:
+        from dotenv import load_dotenv
+
+        load_dotenv()
         try:
             import anthropic
         except ImportError as exc:

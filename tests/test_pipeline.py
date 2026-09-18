@@ -40,3 +40,17 @@ def test_brand_tree_and_first_cycle_gate(tmp_path):
     brand = initialize_brand(tmp_path, "Demo")
     assert (brand / "07_results/results-log.md").exists()
     assert flywheel_gate(brand) == (True, "brand has never launched a batch")
+
+
+def test_pipeline_constructs_default_api_client_only_when_a_seat_runs(monkeypatch):
+    import anthropic
+    from agents.base_seat import BaseSeat
+
+    class FakeAnthropic:
+        def __init__(self, api_key):
+            self.api_key = api_key
+
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    monkeypatch.setattr(anthropic, "Anthropic", FakeAnthropic)
+    client = BaseSeat._create_client()
+    assert client.api_key == "test-key"
