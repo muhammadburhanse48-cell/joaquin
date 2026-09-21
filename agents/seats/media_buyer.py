@@ -1,12 +1,17 @@
-from pathlib import Path
+"""Media Buyer — launch plans and scaling proposals. PROPOSALS ONLY: no code path here
+(or anywhere in this repo) touches a live ad account."""
 
 from agents.base_seat import BaseSeat, SeatResult
-from ._common import prompt_path
 
 
 class MediaBuyer(BaseSeat):
-    def __init__(self, prompts_dir: Path | None = None, **kwargs):
-        super().__init__("media_buyer", prompts_dir or prompt_path("media_buyer", "system.md").parent, **kwargs)
+    max_tokens = 12000
+
+    def __init__(self, **kwargs):
+        super().__init__("media_buyer", **kwargs)
 
     def scaling_proposal(self, evidence: dict) -> SeatResult:
-        return self.run(prompt_path(self.seat_name, "task_scaling_proposal.md").read_text(), evidence)
+        return self.run_task("task_scaling_proposal.md", evidence)
+
+    def launch_plan(self, evidence: dict) -> SeatResult:
+        return self.run_task("task_launch_plan.md", evidence)

@@ -1,17 +1,25 @@
-from pathlib import Path
+"""Creative Director, Mode B — judge panel and QA (isolated critic).
 
-from agents.base_seat import BaseSeat, SeatResult, assert_isolated_evidence
-from ._common import prompt_path
+Refuses, in code, to review anything while holding the brief that produced it.
+"""
+
+from agents.base_seat import BaseSeat, SeatResult
 
 
 class CreativeDirectorB(BaseSeat):
-    def __init__(self, prompts_dir: Path | None = None, **kwargs):
-        super().__init__("creative_director_b", prompts_dir or prompt_path("creative_director_b", "system.md").parent, **kwargs)
+    critic = True
+    max_tokens = 12000
 
-    def judge_and_qa(self, evidence: dict, **kwargs) -> SeatResult:
-        assert_isolated_evidence(evidence)
-        return self.run(prompt_path(self.seat_name, "task_judge_qa.md").read_text(), evidence, **kwargs)
+    def __init__(self, **kwargs):
+        super().__init__("creative_director_b", **kwargs)
 
-    def batch_sweep(self, evidence: dict) -> SeatResult:
-        assert_isolated_evidence(evidence)
-        return self.run(prompt_path(self.seat_name, "task_judge_qa.md").read_text(), evidence)
+    def judge_and_qa(self, evidence: dict, images: list) -> SeatResult:
+        """images: labelled (label, bytes) — candidates, the product photo, the exemplar."""
+        if not images:
+            raise ValueError("the judge panel reviews images; none attached")
+        return self.run_task("task_judge_qa.md", evidence, attached_images=images)
+
+    def batch_sweep(self, evidence: dict, images: list) -> SeatResult:
+        if not images:
+            raise ValueError("the batch sweep reviews the shipping images; none attached")
+        return self.run_task("task_batch_sweep.md", evidence, attached_images=images)
