@@ -1,12 +1,17 @@
-from pathlib import Path
+"""Copy Editor — mechanical fixes, one bounce round, 7-lever score (critic).
+
+Receives the draft only, never the copywriter's rationale.
+"""
 
 from agents.base_seat import BaseSeat, SeatResult
-from ._common import prompt_path
 
 
 class CopyEditor(BaseSeat):
-    def __init__(self, prompts_dir: Path | None = None, **kwargs):
-        super().__init__("copy_editor", prompts_dir or prompt_path("copy_editor", "system.md").parent, **kwargs)
+    critic = True
+    max_tokens = 16000
+
+    def __init__(self, **kwargs):
+        super().__init__("copy_editor", **kwargs)
 
     def edit(self, evidence: dict) -> SeatResult:
-        return self.run(prompt_path(self.seat_name, "task_edit.md").read_text(), evidence)
+        return self.run_task("task_edit.md", evidence)

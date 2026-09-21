@@ -17,14 +17,15 @@ class Settings:
     target_cpa: float = 30.0
 
 
-def load_settings(*, require_integrations: bool = True) -> Settings:
+def load_settings(*, require_required: bool = True) -> Settings:
+    """Load env vars. Missing required keys fail here, at startup, not at first use."""
     load_dotenv()
     required = {
         "ANTHROPIC_API_KEY": os.getenv("ANTHROPIC_API_KEY", ""),
         "TELEGRAM_BOT_TOKEN": os.getenv("TELEGRAM_BOT_TOKEN", ""),
         "ALLOWED_TELEGRAM_USERNAME": os.getenv("ALLOWED_TELEGRAM_USERNAME", ""),
     }
-    if require_integrations:
+    if require_required:
         missing = [name for name, value in required.items() if not value]
         if missing:
             raise RuntimeError(f"Missing required environment variables: {', '.join(missing)}")

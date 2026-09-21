@@ -7,3 +7,5 @@ brands/*
 shared/*
 !shared/.gitkeep
 *.log
+PROJECT_STATUS.md
+docs

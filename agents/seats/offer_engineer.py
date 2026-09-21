@@ -1,14 +1,15 @@
-from pathlib import Path
+"""Offer Engineer — rebuilds price/bundle/bonus/guarantee when the offer is the constraint.
+
+GAP-FILL: the client's docs give this seat no prompt; see agents/prompts/offer_engineer.
+Proposals only; never changes a live price.
+"""
 
 from agents.base_seat import BaseSeat, SeatResult
-from ._common import prompt_path
 
 
 class OfferEngineer(BaseSeat):
-    """Gap-filled wrapper; source prompt explicitly labels this seat unsourced."""
+    def __init__(self, **kwargs):
+        super().__init__("offer_engineer", **kwargs)
 
-    def __init__(self, prompts_dir: Path | None = None, **kwargs):
-        super().__init__("offer_engineer", prompts_dir or prompt_path("offer_engineer", "system.md").parent, **kwargs)
-
-    def offer_rebuild(self, evidence: dict) -> SeatResult:
-        return self.run(prompt_path(self.seat_name, "task_offer_rebuild_gap_fill.md").read_text(), evidence)
+    def rebuild(self, evidence: dict) -> SeatResult:
+        return self.run_task("task_offer_rebuild_gap_fill.md", evidence)

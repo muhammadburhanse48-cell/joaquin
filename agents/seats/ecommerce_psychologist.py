@@ -1,13 +1,13 @@
-from pathlib import Path
+"""Ecommerce Psychologist — one pre-spend pass over the concept portfolio (critic)."""
 
-from agents.base_seat import BaseSeat, SeatResult, assert_isolated_evidence
-from ._common import prompt_path
+from agents.base_seat import BaseSeat, SeatResult
 
 
 class EcommercePsychologist(BaseSeat):
-    def __init__(self, prompts_dir: Path | None = None, **kwargs):
-        super().__init__("ecommerce_psychologist", prompts_dir or prompt_path("ecommerce_psychologist", "system.md").parent, **kwargs)
+    critic = True
+
+    def __init__(self, **kwargs):
+        super().__init__("ecommerce_psychologist", **kwargs)
 
     def psych_review(self, evidence: dict) -> SeatResult:
-        assert_isolated_evidence(evidence)
-        return self.run(prompt_path(self.seat_name, "task_psych_review.md").read_text(), evidence)
+        return self.run_task("task_psych_review.md", evidence)
