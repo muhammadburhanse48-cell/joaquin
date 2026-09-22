@@ -19,9 +19,11 @@ TELEGRAM_LIMIT = 3900
 
 
 class TelegramService:
-    def __init__(self, root: Path, allowed_username: str, model: str = "claude-sonnet-4-6"):
+    def __init__(self, root: Path, allowed_username: str, model: str = "claude-sonnet-4-6",
+                 max_parallel: int = 4, max_parallel_images: int = 2):
         self.root = Path(root)
-        self.pipeline = Pipeline(self.root, model=model)
+        self.pipeline = Pipeline(self.root, model=model, max_parallel=max_parallel,
+                                 max_parallel_images=max_parallel_images)
         self.allowed_username = allowed_username
         self.tasks: dict[str, asyncio.Task] = {}
 
@@ -126,7 +128,8 @@ def build_application(service: TelegramService):
 def main() -> None:
     logging.basicConfig(level=logging.INFO)
     settings = load_settings()  # fails loudly at startup if a required key is missing
-    service = TelegramService(Path.cwd(), settings.allowed_telegram_username, settings.model)
+    service = TelegramService(Path.cwd(), settings.allowed_telegram_username, settings.model,
+                              settings.max_parallel, settings.max_parallel_images)
     build_application(service).run_polling()
 
 

@@ -164,7 +164,18 @@ def test_missing_source_material_and_missing_product_photo_ask_the_human(root, b
         f.unlink()
     client = ScriptedClient()
     status, _ = run(Pipeline(root, client=client))
-    assert status.state == "awaiting_input" and "own-reviews.md" in status.message and client.calls == []
+    # research fails its own local file-existence check before any API call — but it now runs
+    # in the same wave as pattern_mining (Phase 1b), which reads completely disjoint inputs and
+    # has everything it needs, so it is free to make its (independent) calls concurrently. The
+    # reported failure is still research's — the earlier stage by STAGES order — and patterns'
+    # work is not wasted: it gets checkpointed, so a resume after the human supplies the missing
+    # research files does not redo it.
+    assert status.state == "awaiting_input" and status.current_stage == "research"
+    assert "own-reviews.md" in status.message
+    assert not client.seen("DO THIS\n1. Extract every distinct theme")  # research never called the model
+    assert client.seen("VISUAL TEARDOWN")  # pattern_mining's independent work still ran
+    b = Batch.load(brand, "B01")
+    assert "pattern_mining" in b.completed and "research" not in b.completed
 
 
 def test_one_run_per_brand_at_a_time(root, brand):

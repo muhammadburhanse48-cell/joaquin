@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import re
+import threading
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -18,20 +19,36 @@ def _json(obj) -> str:
 
 
 class ScriptedClient:
-    def __init__(self, judge=None, psych=None, editor_bounce=False, analyst_ads=None, mining_quote=QUOTE_1):
+    def __init__(self, judge=None, psych=None, editor_bounce=False, analyst_ads=None, mining_quote=QUOTE_1,
+                 rendezvous: tuple[str, str] | None = None, rendezvous_timeout: float = 5.0):
+        """rendezvous: two prompt-substrings. A call whose prompt contains either one blocks on
+        a two-party threading.Barrier until the OTHER one also arrives — deterministic proof
+        that two calls are genuinely in flight at once (no sleeps, no timing thresholds; if
+        they are not concurrent, the lone caller times out and raises BrokenBarrierError)."""
         self.calls: list[dict] = []
         self.messages = self
         self.judge, self.psych = judge, psych
         self.editor_bounce, self.analyst_ads, self.mining_quote = editor_bounce, analyst_ads, mining_quote
         self._editor_calls = 0
+        # create() runs on real OS threads (Stages.call -> asyncio.to_thread) whenever the
+        # orchestrator fans calls out concurrently — guard the mutable state.
+        self._lock = threading.RLock()
+        self.threads_used: set[int] = set()
+        self._rendezvous = rendezvous
+        self._barrier = threading.Barrier(2, timeout=rendezvous_timeout) if rendezvous else None
 
     # -- the Anthropic surface -------------------------------------------------
     def create(self, **kwargs):
-        self.calls.append(kwargs)
         content = kwargs["messages"][0]["content"]
         text = content[-1]["text"]
         labels = [b["text"] for b in content if b["type"] == "text" and b["text"].startswith("[")]
-        return SimpleNamespace(content=[SimpleNamespace(type="text", text=self.reply(text, labels))],
+        with self._lock:
+            self.calls.append(kwargs)
+            self.threads_used.add(threading.get_ident())
+        if self._barrier is not None and any(needle in text for needle in self._rendezvous):
+            self._barrier.wait()  # blocks here, outside the lock, so the other side can arrive
+        reply = self.reply(text, labels)
+        return SimpleNamespace(content=[SimpleNamespace(type="text", text=reply)],
                                usage=SimpleNamespace(input_tokens=1, output_tokens=1))
 
     def seen(self, needle: str) -> list[dict]:
@@ -76,8 +93,9 @@ class ScriptedClient:
         if "write the copy sheet for batch" in t:
             return "COPY DRAFT\n" + self._copy_table(t) + "\n→ Human compliance review\n- none\n7-lever self-score: 14"
         if "THE DRAFT ---" in t:
-            self._editor_calls += 1
-            bounce = self.editor_bounce and self._editor_calls == 1
+            with self._lock:
+                self._editor_calls += 1
+                bounce = self.editor_bounce and self._editor_calls == 1
             return ("Edited asset\n" + self._copy_table(t) + "\n→ Human compliance review\n- 'lifetime' claim\n"
                     + _json({"lever_scores": [2, 2, 2, 2, 2, 2, 1], "hard_gate_failures": [],
                              "bounces": [{"defect": "no VoC anchor", "evidence_line": "L2",
@@ -136,8 +154,12 @@ class FakeImageSource:
 
     def __init__(self):
         self.requests = []
+        self._lock = threading.RLock()  # generate() runs on real threads under concurrent fan-out
+        self.threads_used: set[int] = set()
 
     def generate(self, prompt, product_photo, n, out_dir):
-        self.requests.append((prompt, product_photo))
+        with self._lock:
+            self.requests.append((prompt, product_photo))
+            self.threads_used.add(threading.get_ident())
         out_dir.mkdir(parents=True, exist_ok=True)
         return [(out_dir / f"c{i}.png").write_bytes(PNG) or out_dir / f"c{i}.png" for i in range(1, n + 1)]

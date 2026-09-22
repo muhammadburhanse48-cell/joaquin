@@ -26,6 +26,31 @@ FORBIDDEN_KEYS = ("brief", "hypothesis", "rationale", "director_notes")
 BRIEF_MARKERS = ("# Creative Brief —", "## The bet", "director_notes")
 
 
+def create_shared_client(max_parallel: int = 4) -> Any:
+    """One Anthropic client for every seat call a Pipeline makes: `anthropic.Anthropic`'s sync
+    client is thread-safe (seat calls run via asyncio.to_thread, real OS threads), so sharing
+    it avoids spinning up a fresh httpx connection pool per call. Sized to `max_parallel` and
+    given an explicit timeout — with none, a hung request can hold a semaphore slot forever,
+    which becomes a real deadlock once independent stages share that semaphore (Phase 1)."""
+    from dotenv import load_dotenv
+
+    load_dotenv()
+    try:
+        import anthropic
+        import httpx
+    except ImportError as exc:
+        raise RuntimeError(
+            "anthropic is required to run seats; install requirements.txt"
+        ) from exc
+    http_client = httpx.Client(
+        limits=httpx.Limits(max_connections=max(10, 2 * max_parallel),
+                            max_keepalive_connections=max_parallel),
+        timeout=httpx.Timeout(900.0, connect=10.0),
+    )
+    return anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"), max_retries=4,
+                               http_client=http_client)
+
+
 class IsolationViolation(ValueError):
     """Author context reached a critic seat. The review is refused."""
 
@@ -102,6 +127,9 @@ class BaseSeat:
 
     @staticmethod
     def _create_client() -> Any:
+        """Fallback for a seat constructed with no client (direct/manual use). No connection
+        pool sizing or explicit timeout — a Pipeline should use create_shared_client instead,
+        one client for every seat call it makes."""
         from dotenv import load_dotenv
 
         load_dotenv()

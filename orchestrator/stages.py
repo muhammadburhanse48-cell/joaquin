@@ -8,15 +8,17 @@ never hand one seat another seat's reasoning: critics receive images and files o
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import csv
 import io
 import json
 import re
 import shutil
+import threading
 from dataclasses import dataclass
 from datetime import date, timedelta
 from pathlib import Path
-from typing import Callable
+from typing import Any, Callable
 
 from agents.seats.copy_editor import CopyEditor
 from agents.seats.copywriter import Copywriter
@@ -29,7 +31,8 @@ from agents.seats.media_buyer import MediaBuyer
 from agents.seats.opportunity_scout import OpportunityScout
 
 from . import gates
-from .brand_state import Batch, append_ledger, has_content, latest_account_report, read, slug
+from .brand_state import (Batch, append_ledger, atomic_write, has_content,
+                          latest_account_report, read, slug)
 from .economics import derived_targets_text
 from .errors import AwaitingInput, GateBlocked, StageError
 from .imagegen import IMAGE_SUFFIXES, candidates
@@ -50,6 +53,27 @@ NONE_ON_FILE = "none on file"
 # Models write "## Persona: Name", "## Persona 1: Name", "### Persona 2 — Name": accept all.
 PERSONA_HEADING = r"#{2,3}\s+Persona\b(?!s)[^\n]*"
 QUOTE_AUDIT_MAX_BAD = 0.25
+
+# (brand, stage) of the coroutine currently making seat calls — set by Pipeline.run's run_one
+# wrapper so a failed call's output and usage are attributed to the stage that actually failed,
+# never a stage or brand running concurrently in the same process (the bot shares one Pipeline).
+CURRENT_STAGE: contextvars.ContextVar[tuple[str, str]] = contextvars.ContextVar(
+    "CURRENT_STAGE", default=("?", "?"))
+
+
+def _rate_limit_retry_after(exc: BaseException, default: float = 5.0) -> float | None:
+    """None if `exc` isn't a rate-limit/overload error; otherwise how long to pause every
+    other concurrent seat call before letting new ones start (the server's Retry-After header
+    if it gave one, else a fixed backoff). Duck-typed, not an `isinstance(exc, anthropic...)`
+    check, so this has no hard import-time dependency on the anthropic package."""
+    status = getattr(exc, "status_code", None)
+    if status not in (429, 529) and type(exc).__name__ not in ("RateLimitError", "InternalServerError"):
+        return None
+    header = getattr(getattr(exc, "response", None), "headers", {}) or {}
+    try:
+        return float(header.get("retry-after", default))
+    except (TypeError, ValueError):
+        return default
 
 
 @dataclass
@@ -116,12 +140,66 @@ class Stages:
 
     async def call(self, fn: Callable, *a, **kw):
         loop = asyncio.get_running_loop()
-        if getattr(self, "_sem_loop", None) is not loop:  # a semaphore belongs to one event loop
-            self._sem_loop, self._sem = loop, asyncio.Semaphore(self.max_parallel)
+        if getattr(self, "_sem_loop", None) is not loop:  # this state belongs to one event loop
+            self._sem_loop = loop
+            self._sem = asyncio.Semaphore(self.max_parallel)
+            self._cooldown = asyncio.Event()
+            self._cooldown.set()
+        # A sibling's 429 pauses everyone briefly before they queue on the semaphore — the SDK's
+        # own max_retries backs off per-request, but under fan-out every worker hits the limit
+        # independently and would otherwise all retry in lockstep. This never blocks the request
+        # that is already in flight, only new ones about to start.
+        await self._cooldown.wait()
         async with self._sem:
-            res = await asyncio.to_thread(fn, *a, **kw)
-        self.last_output = getattr(res, "output_text", None)
+            try:
+                res = await asyncio.to_thread(fn, *a, **kw)
+            except Exception as exc:
+                retry_after = _rate_limit_retry_after(exc)
+                if retry_after is not None and self._cooldown.is_set():
+                    self._cooldown.clear()
+                    try:
+                        await asyncio.sleep(retry_after)
+                    finally:
+                        self._cooldown.set()
+                raise
+        self._record_output(res)
         return res
+
+    def _record_output(self, res: Any) -> None:
+        stage_key = CURRENT_STAGE.get()
+        text = getattr(res, "output_text", None)
+        if text is not None:
+            lock = self.__dict__.setdefault("_last_output_lock", threading.Lock())
+            with lock:
+                self.__dict__.setdefault("_last_output", {})[stage_key] = text
+        usage = getattr(getattr(res, "raw_response", None), "usage", None)
+        if usage is not None:
+            lock = self.__dict__.setdefault("_usage_lock", threading.Lock())
+            with lock:
+                store = self.__dict__.setdefault("_usage", {})
+                cur = store.setdefault(stage_key, {"calls": 0, "input_tokens": 0, "output_tokens": 0})
+                cur["calls"] += 1
+                cur["input_tokens"] += getattr(usage, "input_tokens", 0) or 0
+                cur["output_tokens"] += getattr(usage, "output_tokens", 0) or 0
+
+    def last_output_for(self, brand: str, stage: str) -> str | None:
+        """The most recent seat output for this (brand, stage), or None. Keyed, not a single
+        shared attribute, because the bot runs one Pipeline for every brand and a stage can
+        run beside another (Phase 1 waves) — a plain `self.last_output` would race."""
+        return self.__dict__.get("_last_output", {}).get((brand, stage))
+
+    def usage_for(self, brand: str, stage: str) -> dict:
+        return self.__dict__.get("_usage", {}).get(
+            (brand, stage), {"calls": 0, "input_tokens": 0, "output_tokens": 0})
+
+    def usage_summary(self, brand: str) -> dict:
+        """Total calls/tokens across every stage this Pipeline has recorded for `brand`."""
+        total = {"calls": 0, "input_tokens": 0, "output_tokens": 0}
+        for (b, _stage), u in self.__dict__.get("_usage", {}).items():
+            if b == brand:
+                for k in total:
+                    total[k] += u[k]
+        return total
 
     def _research_ev(self, ctx: Ctx) -> dict:
         r = ctx.brand_dir / "03_research"
@@ -224,17 +302,16 @@ class Stages:
         if absent:
             raise AwaitingInput(f"{ev_file.name} has no evidence line for image(s) {', '.join(absent)}")
         scout = self.seat(OpportunityScout)
-        rows: list[dict] = []
-        for start in range(0, len(images), 8):
-            nums = [f"{i:02d}" for i in range(start + 1, min(start + 8, len(images)) + 1)]
-            out = (await self.call(
-                scout.visual_teardown,
-                {"niche": niche, "evidence_per_image": "\n".join(lines[n] for n in nums)},
-                [(f"image {n}", images[int(n) - 1].read_bytes()) for n in nums])).output_text
-            got = next(iter(parse_tables(out)), [])
-            if len(got) != len(nums):
-                raise StageError(f"teardown returned {len(got)} rows for {len(nums)} images")
-            rows += got
+        batches = [[f"{i:02d}" for i in range(start + 1, min(start + 8, len(images)) + 1)]
+                  for start in range(0, len(images), 8)]
+        # Each 8-image batch is an independent scout.visual_teardown call — run them concurrently.
+        # asyncio.gather returns results in ARGUMENT order (not completion order), so flattening
+        # keeps the rows in image order regardless of which batch's call returns first; row order
+        # is load-bearing downstream (pattern_mining's table, and the manifest maps entries back
+        # to images[n-1]).
+        outs = await asyncio.gather(*(self._teardown_batch(scout, niche, lines, images, nums)
+                                      for nums in batches))
+        rows: list[dict] = [r for out in outs for r in out]
         table = render_table(rows, list(rows[0]))
         advertisers = {m.group(1) for m in re.finditer(r"advertiser:\s*(\S+)", "\n".join(lines.values()))}
         lib = (await self.call(scout.pattern_mining, {
@@ -244,8 +321,7 @@ class Stages:
         header = (f"# Visual Pattern Library — {niche}\nRun date: {today} · Ads analysed: {len(rows)} · "
                   f"Advertisers: {len(advertisers)} · STALE AFTER: {today + timedelta(days=30)}\n\n")
         lib_path = gates.pattern_library_path(ctx.root, niche)
-        lib_path.parent.mkdir(parents=True, exist_ok=True)
-        lib_path.write_text(header + lib.strip() + "\n")
+        atomic_write(lib_path, header + lib.strip() + "\n")
         sel = (await self.call(scout.swipe_vault, {
             "n_images": len(rows), "teardown_rows": table, "pattern_library": lib,
             "evidence_per_image": "\n".join(lines.values())})).output_text
@@ -260,12 +336,26 @@ class Stages:
             src = images[int(n.group(1)) - 1]
             e["file"] = Path(e["file"]).with_suffix(src.suffix.lower()).name
             shutil.copy2(src, vault / e["file"])
-        (vault / "manifest.json").write_text(json.dumps(entries, indent=2, ensure_ascii=False))
+        atomic_write(vault / "manifest.json", json.dumps(entries, indent=2, ensure_ascii=False))
         (vault / "selection-notes.md").write_text(sel)
         ok, why = gates.pattern_gate(ctx.root, niche)
         if not ok:
             raise GateBlocked(f"pattern gate still failing after mining: {why}")
         return f"{len(rows)} ads analysed, {len(entries)} swipe-vault images"
+
+    async def _teardown_batch(self, scout: OpportunityScout, niche: str, lines: dict[str, str],
+                              images: list[Path], nums: list[str]) -> list[dict]:
+        """One independent visual_teardown call over up to 8 images. Caller gathers these
+        concurrently and relies on asyncio.gather's argument-order guarantee to keep rows
+        in image order — do not reorder or complete-order-sort the results here."""
+        out = (await self.call(
+            scout.visual_teardown,
+            {"niche": niche, "evidence_per_image": "\n".join(lines[n] for n in nums)},
+            [(f"image {n}", images[int(n) - 1].read_bytes()) for n in nums])).output_text
+        got = next(iter(parse_tables(out)), [])
+        if len(got) != len(nums):
+            raise StageError(f"teardown returned {len(got)} rows for images {nums[0]}-{nums[-1]}")
+        return got
 
     # ------------------------------------------------ Stage 3: concept portfolio
     async def stage_concepts(self, ctx: Ctx) -> str:
@@ -393,12 +483,25 @@ class Stages:
     def _brief(self, ctx: Ctx, nn: str) -> str:
         return (ctx.batch.dir / "briefs" / ctx.batch.slots[nn]["brief"]).read_text()
 
+    def _image_semaphore(self) -> asyncio.Semaphore:
+        """A semaphore separate from Stages._sem: image-generation APIs have their own, much
+        lower rate limits than text, so they must not share the text semaphore's budget."""
+        loop = asyncio.get_running_loop()
+        if getattr(self, "_img_sem_loop", None) is not loop:
+            self._img_sem_loop = loop
+            self._img_sem = asyncio.Semaphore(self.max_parallel_images)
+        return self._img_sem
+
     async def _ensure_candidates(self, ctx: Ctx) -> int:
         """2-3 candidates for every open slot's current round, or stop with AwaitingInput."""
         photo = self._product_photo(ctx)
         cards = self._research_ev(ctx)["persona_cards"]
-        gd, need, made = self.seat(GraphicDesigner), [], 0
+        gd = self.seat(GraphicDesigner)
         cps = int(ctx.profile["candidates_per_slot"])
+        # Pass A — sequential, no model/generator I/O: build every open slot's prompt and
+        # spec.json in slot order. Keeps prompt-writing order deterministic and independent of
+        # generation timing.
+        jobs: list[tuple[str, Path, str]] = []
         for nn, s in sorted(ctx.batch.slots.items()):
             if s["state"] != "open":
                 continue
@@ -422,11 +525,24 @@ class Stages:
             (ctx.batch.dir / "prompts" / f"{nn}_r{s['round']}.md").write_text(
                 f"Attach as reference: {photo}\n\n{prompt}\n")
             (rdir / "spec.json").write_text(json.dumps(req.sidecar, indent=2, ensure_ascii=False))
-            try:
+            jobs.append((nn, rdir, prompt))
+        # Pass B — every slot's generation call is independent of every other slot's; run them
+        # concurrently under a dedicated (lower) semaphore. return_exceptions so one slot's
+        # AwaitingInput (or a real generator error) doesn't cancel the rest.
+        async def _generate(nn: str, rdir: Path, prompt: str) -> None:
+            async with self._image_semaphore():
                 await asyncio.to_thread(self.image_source.generate, prompt, photo, cps, rdir)
-                made += 1
-            except AwaitingInput:
-                need.append(f"{rdir.relative_to(ctx.brand_dir)} ({cps} images)")
+
+        results = await asyncio.gather(*(_generate(nn, rdir, prompt) for nn, rdir, prompt in jobs),
+                                       return_exceptions=True)
+        # A real (non-AwaitingInput) generator error must not be swallowed as "needs images" —
+        # surface the first one, in slot order.
+        for (nn, rdir, _), r in zip(jobs, results):
+            if isinstance(r, Exception) and not isinstance(r, AwaitingInput):
+                raise r
+        need = [f"{rdir.relative_to(ctx.brand_dir)} ({cps} images)"
+               for (nn, rdir, _), r in zip(jobs, results) if isinstance(r, AwaitingInput)]
+        made = sum(1 for r in results if not isinstance(r, BaseException))
         if need:
             raise AwaitingInput(
                 f"{len(need)} slot(s) need candidate images. Generation prompts are in "
