@@ -11,9 +11,11 @@ made, so the chat-style handbook prompts can run as stateless API calls:
 3. Each seat's SYSTEM material and TASK material are split into system.md and
    task_*.md instead of being duplicated in both (which sent every prompt twice).
 
-Anything not in the client's sources (gap-fills, machine-readable envelopes,
-statelessness preambles) sits under a "GAP-FILL" / "ORCHESTRATION" HTML comment
-or an explicitly labelled block so it can be reviewed.
+Anything not in the client's sources (gap-fills, statelessness preambles) sits
+under a "GAP-FILL" / "ORCHESTRATION" HTML comment or an explicitly labelled block
+so it can be reviewed. Output formats for tasks the orchestrator reads are not in
+these files: they are JSON schemas in agents/schemas.py, enforced by the API and
+appended to the task at call time.
 
 Run:  python scripts/build_prompts.py
 """
@@ -89,58 +91,6 @@ def write(seat: str, name: str, text: str, note: str | None = None) -> None:
     head = f"<!-- {note} -->\n" if note else ""
     path.write_text(head + text.strip() + "\n")
 
-
-def json_envelope(what: str, shape: str) -> str:
-    return (
-        "\n\n--- ORCHESTRATION: MACHINE-READABLE " + what + " (required) ---\n"
-        "After your normal output above, append ONE fenced ```json block containing exactly:\n"
-        + shape
-        + "\nThe orchestrator enforces the gates from this block; the prose above stays "
-        "authoritative for the human reader."
-    )
-
-
-# ------------------------------------------------------------------------- envelopes
-PSYCH_ENVELOPE = json_envelope(
-    "VERDICTS",
-    '[{"concept": <number>, "verdict": "PASS"|"FIX"|"SWAP", '
-    '"fix": "<the named change or swap-in; empty for PASS>"}]  (one object per concept)',
-)
-JUDGE_ENVELOPE = json_envelope(
-    "VERDICTS",
-    '[{"slot": "<slot id exactly as labelled on the images>", "winner": "<candidate label>", '
-    '"verdict": "SHIP"|"REGEN", "lever_scores": [<7 integers 0-2, in the order the levers are '
-    'listed>], "hard_gate_failures": ["<name each failed hard gate, or leave empty>"], '
-    '"fix": "<specific evidence-tied fix, empty for SHIP>", '
-    '"fix_type": "regenerate"|"recompose"|""}]  (one object per slot)',
-)
-SWEEP_ENVELOPE = json_envelope(
-    "SWEEP RESULT",
-    '{"checks": [{"n": <1-10>, "result": "PASS"|"FAIL", "files": ["<named files>"], '
-    '"detail": "<one line>"}]}',
-)
-EDITOR_ENVELOPE = json_envelope(
-    "EDIT RESULT",
-    '{"lever_scores": [<7 integers 0-2>], "hard_gate_failures": ["<invented quote/review/stat | '
-    'message-match break | wrong awareness structure>"], "bounces": [{"defect": "...", '
-    '"evidence_line": "...", "source_material": "..."}]}',
-)
-GATE_ENVELOPE = json_envelope(
-    "SCRIPT-GATE RESULT",
-    '[{"script": "<id>", "verdict": "SHIP"|"REVISE", "message_match": <0-10>, '
-    '"hook_strength": <0-10>, "voc_density": <0-10>, "failed_checks": ["..."], "fix": "..."}]',
-)
-READOUT_ENVELOPE = json_envelope(
-    "READOUT ROWS",
-    '{"ads": [{"date": "YYYY-MM-DD", "ad_name": "", "ad_id": "", "batch": "B01|UNMAPPED", '
-    '"concept": "", "campaign_type": "", "spend": <number>, "purchases": <number|null>, '
-    '"cpa": <number|null>, "roas": <number|null>, "ctr": <number|null>, "freq": <number|null>, '
-    '"verdict": "PROMOTE|SCALE|ITERATE|NO-PROMOTE|KILL|FATIGUE|LEARNING|below floor — no verdict|NOT LAUNCHED", '
-    '"action_taken": ""}], "winning_variables": [{"variable_type": "", "value": "", "batch": "", '
-    '"evidence": "<spend, CPA vs target, CTR — numbers or no row>", "tier": "T1", "date": "YYYY-MM-DD", '
-    '"status": "ACTIVE|fatigued|RETIRED"}], "learnings": ["<cross-brand principle with numbers>"], '
-    '"invalidate_research": true|false}',
-)
 
 EVIDENCE_BASE = """\
 --- PERSONA CARDS ---
@@ -269,7 +219,7 @@ def ecommerce_psychologist() -> None:
     write(s, "system.md", system)
     task = slots(task, ["concept_portfolio", "persona_cards", "customer_language",
                         "market_diagnosis", "results_log", "landing_page"])
-    write(s, "task_psych_review.md", task + PSYCH_ENVELOPE)
+    write(s, "task_psych_review.md", task)
 
 
 def graphic_designer() -> None:
@@ -305,7 +255,7 @@ def creative_director_b() -> None:
         "<attach + its evidence>": f"{ATTACHED}\n{{{{exemplar_evidence}}}}",
     })
     ctx = slots(ctx, ["persona_card", "brand_rules", "landing_page_promise"])
-    write(s, "task_judge_qa.md", ctx + JUDGE_ENVELOPE)
+    write(s, "task_judge_qa.md", ctx)
     sweep = sec(s, "TASK")
     sweep = lit(sweep, {
         "<N>": "{{n_creatives}}", "B<NN>": "B{{batch}}", "<qualifier>": "{{qualifier}}",
@@ -313,7 +263,7 @@ def creative_director_b() -> None:
     })
     sweep = slots(sweep, ["banned_words"])
     write(s, "task_batch_sweep.md",
-          sweep + "\n\n--- THE COPY SHEET ---\n{{copy_sheet}}" + SWEEP_ENVELOPE,
+          sweep + "\n\n--- THE COPY SHEET ---\n{{copy_sheet}}",
           "ORCHESTRATION: the client's sweep names 'the copy sheet' but has no slot for it.")
 
 
@@ -361,7 +311,7 @@ def copy_editor() -> None:
     write(s, "system.md", system)
     ev = slots(ev, ["draft", "persona_cards", "customer_language", "market_diagnosis",
                     "feeding_creative", "shipped_copy", "brand_voice"])
-    write(s, "task_edit.md", ev + EDITOR_ENVELOPE)
+    write(s, "task_edit.md", ev)
 
 
 def video_editor() -> None:
@@ -376,8 +326,7 @@ def video_editor() -> None:
     write(s, "system_script_gate.md", system,
           "Critic seat: the client requires the script gate to be a fresh, isolated call.")
     write(s, "task_script_gate.md",
-          slots(ev, ["scripts", "first_3s_rules", "customer_language", "landing_page_promise"])
-          + GATE_ENVELOPE)
+          slots(ev, ["scripts", "first_3s_rules", "customer_language", "landing_page_promise"]))
     t3 = lit(sec(s, "TASK 3"), {
         "--- THE WINNING STATIC --- <attach the image>": f"--- THE WINNING STATIC --- {ATTACHED}",
         "<spend, CPA/ROAS, verdict>": "{{result}}",
@@ -392,7 +341,7 @@ def analyst() -> None:
     t = lit(sec(s, "TASK"), {"<brand>": "{{brand}}", "<date>": "{{week_of}}"})
     t = slots(t, ["ads_3d", "ads_7d", "ads_lifetime", "country_breakdown", "economics",
                   "creative_ledger", "results_log"])
-    write(s, "task_readout.md", t + READOUT_ENVELOPE)
+    write(s, "task_readout.md", t)
 
 
 def media_buyer() -> None:

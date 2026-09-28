@@ -15,6 +15,10 @@ class Settings:
     allowed_telegram_username: str
     model: str = "claude-sonnet-4-6"
     target_cpa: float = 30.0
+    # How many seat (text) calls / image-generation calls may run at once, across every stage
+    # and brand this process handles — see orchestrator.stages.Stages.call / _img_sem.
+    max_parallel: int = 4
+    max_parallel_images: int = 2
 
 
 def load_settings(*, require_required: bool = True) -> Settings:
@@ -35,4 +39,6 @@ def load_settings(*, require_required: bool = True) -> Settings:
         allowed_telegram_username=required["ALLOWED_TELEGRAM_USERNAME"],
         model=os.getenv("ANTHROPIC_MODEL", "claude-sonnet-4-6"),
         target_cpa=float(os.getenv("TARGET_CPA", "30")),
+        max_parallel=int(os.getenv("MAX_PARALLEL", "4")),
+        max_parallel_images=int(os.getenv("MAX_PARALLEL_IMAGES", "2")),
     )

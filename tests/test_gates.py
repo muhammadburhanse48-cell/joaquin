@@ -7,8 +7,7 @@ import pytest
 from orchestrator import economics as ec
 from orchestrator import gates
 from orchestrator.brand_state import Batch, initialize_brand, mark_launched, append_results, append_winning_variables
-from orchestrator.parsing import extract_json, parse_tables, split_named_files, unverified_quotes
-from orchestrator.errors import StageError
+from orchestrator.parsing import match_candidate, parse_tables, slot_id, unverified_quotes
 
 
 def test_economics_match_the_handbook_worked_example():
@@ -134,6 +133,35 @@ def test_qa_gate_is_decided_by_code_not_prose(entry, ok):
     assert gates.qa_gate(entry)[0] is ok
 
 
+@pytest.mark.parametrize("written", [["none"], ["N/A"], "None", ["no hard-gate failures."], [""], None, "  "])
+def test_no_failure_placeholders_are_not_hard_gate_failures(written):
+    assert gates.hard_failures(written) == []
+    assert gates.qa_gate({"lever_scores": [2] * 7, "verdict": "SHIP", "hard_gate_failures": written})[0]
+
+
+def test_a_named_hard_gate_failure_still_blocks_and_is_never_split_into_letters():
+    assert gates.hard_failures("product inaccuracy") == ["product inaccuracy"]
+    assert gates.hard_failures(["none", "wrong logo"]) == ["wrong logo"]
+    assert gates.qa_gate({"lever_scores": [2] * 7, "verdict": "SHIP",
+                          "hard_gate_failures": "product inaccuracy"})[1] == "hard gate failed: product inaccuracy"
+
+
+@pytest.mark.parametrize("written,slot", [
+    ("slot 03 / c2", "03"), ("03", "03"), ("3", "03"), ("Slot 3", "03"), ("slot #12", "12"),
+    ("B01-03", "03"), ("B01 slot 03", "03"), ("B01 · 03", "03"), ("03 / c2", "03"), ("c2", None), ("", None),
+])
+def test_slot_id_never_reads_the_batch_or_candidate_number(written, slot):
+    assert slot_id(written) == slot
+
+
+@pytest.mark.parametrize("written,stem", [
+    ("c2", "c2"), ("C2", "c2"), ("c2.png", "c2"), ("slot 03 / c2", "c2"), ("candidate 2", "c2"),
+    ("#2", "c2"), ("2", "c2"), ("c02", "c2"), ("c9", None), ("the second one", None),
+])
+def test_match_candidate_tolerates_how_the_judge_names_the_winner(written, stem):
+    assert match_candidate(written, ["c1", "c2", "c3"]) == stem
+
+
 def test_copy_lint_and_gate():
     rows = [{"#": "1", "headline": "x" * 41, "primary_text": "🔥 hi", "link": ""}]
     text = " ".join(gates.copy_lint(rows))
@@ -170,13 +198,20 @@ def test_winning_variables_need_t1_numbers(root):
     assert kept == 1
 
 
+def test_structured_copy_slots_are_written_back_into_the_brief_in_the_one_readable_form():
+    from orchestrator.stages import with_copy_slots
+    loose = BRIEF.split("## Copy slots")[0] + "## Copy slots for the image\nsee the image\n## Compliance notes\nnone\n"
+    assert not gates.brief_gate(loose)[0]  # the model's free-form slot block alone is unreadable
+    fixed = with_copy_slots(loose, {"eyebrow": "", "headline": 'The "one less thing" bag',
+                                    "proof": "4.8 stars", "was": "", "now": "$59"})
+    assert gates.brief_gate(fixed)[0]
+    assert gates.copy_slots(fixed) =={"eyebrow": "", "headline": "The 'one less thing' bag",
+                                 "proof": "4.8 stars", "was": "", "now": "$59"}
+    assert fixed.count("## Copy slots") == 1 and "## Compliance notes\nnone" in fixed
+    assert "## Copy slots" in with_copy_slots("# Creative Brief — x\n", {"headline": "h"})
+
+
 def test_parsing_helpers():
-    data, prose = extract_json('text\n```json\n{"a": 1}\n```\n')
-    assert data == {"a": 1} and prose == "text"
-    with pytest.raises(StageError):
-        extract_json("no block")
-    files = split_named_files("# customer-language.md\nAAA\n# market-diagnosis.md\nBBB", ["customer-language.md", "market-diagnosis.md"])
-    assert files == {"customer-language.md": "AAA", "market-diagnosis.md": "BBB"}
     assert parse_tables("| a | b |\n|---|---|\n| 1 | 2 |\n")[0] == [{"a": "1", "b": "2"}]
     bad, total = unverified_quotes('- "I love it so much really"\n- "invented line nobody said"', "I love it so much, really!")
     assert (bad, total) == (["invented line nobody said"], 2)

@@ -24,8 +24,3 @@ Any FAIL means the batch does not stage until it's fixed. Don't soften this.
 
 --- THE COPY SHEET ---
 {{copy_sheet}}
-
---- ORCHESTRATION: MACHINE-READABLE SWEEP RESULT (required) ---
-After your normal output above, append ONE fenced ```json block containing exactly:
-{"checks": [{"n": <1-10>, "result": "PASS"|"FAIL", "files": ["<named files>"], "detail": "<one line>"}]}
-The orchestrator enforces the gates from this block; the prose above stays authoritative for the human reader.

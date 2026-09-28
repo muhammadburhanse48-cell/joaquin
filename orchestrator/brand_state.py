@@ -10,11 +10,14 @@ time pressure, these four must not be it:
 
 from __future__ import annotations
 
+import fcntl
 import json
+import os
 import re
 from dataclasses import dataclass, field
 from datetime import date
 from pathlib import Path
+from typing import Callable
 
 from .errors import AwaitingInput
 
@@ -83,6 +86,32 @@ PROFILE_OPTIONAL = {
 
 def slug(name: str) -> str:
     return re.sub(r"[^A-Za-z0-9]+", "", name.title()) or "Concept"
+
+
+def atomic_write(path: Path, text: str) -> None:
+    """Write via a temp file + os.replace: a crash or a racing reader never sees a torn file."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(text)
+    os.replace(tmp, path)
+
+
+def locked_rewrite(path: Path, mutate: Callable[[str], str | None]) -> None:
+    """Read-modify-write a file that more than one brand's run can touch concurrently (every
+    shared/*.md ledger, and the per-niche pattern library / swipe-vault manifest two brands in
+    the same niche can both write). Holds an exclusive flock across the read and the write, so
+    a concurrent writer can't silently lose the other's update. `mutate` returns the new text,
+    or None to skip the write (e.g. the entry is already there — idempotent on resume)."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = path.with_name(f".{path.name}.lock")
+    with open(lock_path, "w") as lf:
+        fcntl.flock(lf, fcntl.LOCK_EX)
+        try:
+            new_text = mutate(path.read_text() if path.exists() else "")
+            if new_text is not None:
+                atomic_write(path, new_text)
+        finally:
+            fcntl.flock(lf, fcntl.LOCK_UN)
 
 
 def _write_if_empty(path: Path, content: str) -> None:
@@ -186,7 +215,7 @@ class Batch:
     def save(self) -> None:
         self.dir.mkdir(parents=True, exist_ok=True)
         data = {k: v for k, v in self.__dict__.items() if k != "brand_dir"}
-        self.state_file.write_text(json.dumps(data, indent=2, ensure_ascii=False))
+        atomic_write(self.state_file, json.dumps(data, indent=2, ensure_ascii=False))
 
     @classmethod
     def load(cls, brand_dir: Path, batch_id: str) -> "Batch":
@@ -229,20 +258,25 @@ def mark_launched(brand_dir: Path, batch_id: str, spend: float | None = None) ->
 
 # ------------------------------------------------------------------------ protected files
 def append_ledger(root: Path, brand: str, batch: Batch, rows: list[dict], n_files: int) -> None:
-    """Doc 03: '## <Brand> B07 — date — 10 concepts / 30 files', then the concept rows."""
+    """Doc 03: '## <Brand> B07 — date — 10 concepts / 30 files', then the concept rows.
+    Cross-brand shared file (every brand's launch plan writes here) — locked."""
     from .parsing import render_table
 
     path = Path(root) / "shared" / "creative-ledger.md"
-    text = path.read_text() if path.exists() else SHARED_FILES["creative-ledger.md"]
     header = f"## {brand} {batch.id} — {date.today().isoformat()} — {len(rows)} concepts / {n_files} files"
-    if header in text:  # idempotent on resume
-        return
     hooks = "; ".join(r["HOOK"] for r in rows if r.get("HOOK"))
     block = (
         f"\n{header}\n\n{render_table(rows, LEDGER_COLUMNS)}\n\n"
         f"Don't-repeat additions: {hooks}\nRetired this batch: none\n"
     )
-    path.write_text(text.rstrip("\n") + "\n" + block)
+
+    def mutate(text: str) -> str | None:
+        text = text or SHARED_FILES["creative-ledger.md"]
+        if header in text:  # idempotent on resume
+            return None
+        return text.rstrip("\n") + "\n" + block
+
+    locked_rewrite(path, mutate)
 
 
 def append_results(brand_dir: Path, rows: list[list[str]]) -> None:

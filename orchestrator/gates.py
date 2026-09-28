@@ -192,15 +192,26 @@ def copy_slots(brief: str) -> dict[str, str]:
     return {k.lower(): v.replace("~~", "").strip() for k, v in found}
 
 
+_NO_FAILURE = {"", "none", "n/a", "na", "no", "nil", "null", "-", "—", "no failures", "none failed",
+               "no hard gate failures", "no hard-gate failures"}
+
+
+def hard_failures(value) -> list[str]:
+    """The named hard-gate failures. Models write "no failures" as ["none"], ["N/A"] or a bare
+    string; none of those is a failure, and a string must not be split into characters."""
+    items = [value] if isinstance(value, str) else list(value or [])
+    return [str(h).strip() for h in items if str(h).strip().rstrip(".").lower() not in _NO_FAILURE]
+
+
 def qa_gate(entry: dict) -> Gate:
     """CD-B: 7 levers x 0-2, ship at >=11/14 with zero hard-gate failures. Code decides, not prose."""
     scores = entry.get("lever_scores")
     if not (isinstance(scores, list) and len(scores) == 7
             and all(isinstance(s, int) and 0 <= s <= 2 for s in scores)):
         return False, "all 7 lever scores (0-2) must be written out"
-    hard = [h for h in entry.get("hard_gate_failures") or [] if str(h).strip()]
+    hard = hard_failures(entry.get("hard_gate_failures"))
     if hard:
-        return False, f"hard gate failed: {'; '.join(map(str, hard))}"
+        return False, f"hard gate failed: {'; '.join(hard)}"
     if sum(scores) < QA_PASS_SCORE:
         return False, f"score {sum(scores)}/14 is below {QA_PASS_SCORE}"
     if str(entry.get("verdict", "")).upper() != "SHIP":
@@ -234,9 +245,9 @@ def copy_gate(edit: dict) -> Gate:
     scores = edit.get("lever_scores")
     if not (isinstance(scores, list) and len(scores) == 7 and all(isinstance(s, int) for s in scores)):
         return False, "editor did not write all 7 lever scores"
-    hard = [h for h in edit.get("hard_gate_failures") or [] if str(h).strip()]
+    hard = hard_failures(edit.get("hard_gate_failures"))
     if hard:
-        return False, f"copy hard gate failed: {'; '.join(map(str, hard))}"
+        return False, f"copy hard gate failed: {'; '.join(hard)}"
     if sum(scores) < QA_PASS_SCORE:
         return False, f"editor score {sum(scores)}/14 is below {QA_PASS_SCORE}"
     return True, f"editor score {sum(scores)}/14"
