@@ -8,7 +8,7 @@ from agents.base_seat import BaseSeat, SeatResult
 
 
 class CreativeDirectorA(BaseSeat):
-    max_tokens = 12000
+    max_tokens = 24000
 
     def __init__(self, **kwargs):
         super().__init__("creative_director_a", **kwargs)

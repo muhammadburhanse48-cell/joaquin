@@ -36,11 +36,15 @@ from .brand_state import (Batch, append_ledger, atomic_write, has_content,
 from .economics import derived_targets_text
 from .errors import AwaitingInput, GateBlocked, StageError
 from .imagegen import IMAGE_SUFFIXES, candidates
-from .parsing import (col, extract_json, json_objects, parse_tables, render_table, rows_to_csv,
-                      split_named_files, unverified_quotes)
+from .parsing import col, parse_tables, render_table, rows_to_csv, unverified_quotes
 
 COPY_COLUMNS = ["#", "concept", "angle", "persona", "file_1x1", "on_image", "primary_text",
                 "headline", "cta", "link"]
+# The client's concept-table header (task_concept_portfolio.md). Downstream code looks cells up
+# by header prefix (parsing.col), so structured concepts are stored under these names.
+CONCEPT_COLUMNS = ["#", "concept name", "angle family", "persona", "awareness stage",
+                   "format archetype", "hook (verbatim, ≤5 words)", "proof device",
+                   "70% iterate (of what) or 30% new", "evidence + tier"]
 SOURCE_FILES = {
     "own_reviews": "own-reviews.md",
     "competitor_reviews": "competitor-reviews.md",
@@ -129,6 +133,42 @@ def visual_world(card: str) -> str:
     stop = re.search(r"(?m)^(#{1,4} |[-*] \**[A-Z][^:\n]{0,40}:)", rest)
     text = ((m.group(1) or "") + " " + rest[: stop.start() if stop else len(rest)]).strip()
     return re.sub(r"\s+", " ", text)[:700] or re.sub(r"\s+", " ", card)[:400]
+
+
+def concept_row(n: int, c: dict) -> dict:
+    """A structured concept (agents/schemas.py) as a row of the client's concept table."""
+    mix = "30% new" if c["mix"] == "new" else f"70% iterate of {c['iterates']}".strip()
+    return dict(zip(CONCEPT_COLUMNS, [
+        f"{n:02d}", c["concept_name"], c["angle_family"], c["persona"], c["awareness_stage"],
+        c["format_archetype"], c["hook"], c["proof_device"], mix, c["evidence_and_tier"]]))
+
+
+def sheet_rows(rows: list[dict]) -> list[dict]:
+    """Structured copy rows keyed by the copy sheet's columns ('number' is the '#' column)."""
+    return [{"#": r["number"], **{c: r[c] for c in COPY_COLUMNS[1:]}} for r in rows]
+
+
+def copy_draft_md(draft: dict, *, self_score: bool = True) -> str:
+    """The copywriter's structured draft as the markdown a reader (or the editor) sees.
+    self_score=False is what the editor gets: never the writer's self-assessment."""
+    flags = "".join(f"- {f}\n" for f in draft["compliance_flags"]) or "- none\n"
+    out = (render_table(sheet_rows(draft["rows"]), COPY_COLUMNS) + "\n\n" + draft["working_md"].strip()
+           + "\n\n→ Human compliance review\n" + flags)
+    return out + (f"\n7-lever self-score\n{draft['self_score_md'].strip()}\n" if self_score else "")
+
+
+def with_copy_slots(brief: str, slots: dict) -> str:
+    """Rewrite the brief's 'Copy slots for the image' block from the structured slots, in the
+    one canonical form gates.copy_slots reads, so the brief file stays the single source of
+    truth for what is baked on the image."""
+    def clean(value) -> str:  # a double quote inside a slot would end the quoted string early
+        return re.sub(r'["“”]', "'", str(value).strip())
+
+    line = "  ".join(f'{k}: "{clean(slots.get(k, ""))}"' for k in gates.COPY_SLOTS)
+    block = re.compile(r"(##\s*Copy slots[^\n]*\n)(.*?)(?=\n##\s|\Z)", re.S | re.I)
+    if block.search(brief):
+        return block.sub(lambda m: m.group(1) + line + "\n", brief, count=1)
+    return brief.rstrip() + "\n\n## Copy slots for the image\n" + line + "\n"
 
 
 class Stages:
@@ -250,35 +290,38 @@ class Stages:
         seat = self.seat(CreativeStrategist)
         mining = (await self.call(seat.mining_pass, {
             "brand": ctx.brand, "product": p["product"], "market": p["market"],
-            "buyer_guess": p["buyer_guess"], **src})).output_text
-        files = split_named_files(mining, ["customer-language.md", "market-diagnosis.md"])
-        bad, total = unverified_quotes(files["customer-language.md"], raw)
+            "buyer_guess": p["buyer_guess"], **src})).data
+        language, diagnosis = mining["customer_language_md"].strip(), mining["market_diagnosis_md"].strip()
+        bad, total = unverified_quotes(language, raw)
         r = ctx.brand_dir / "03_research"
         (r / "quote-audit.md").write_text(
             f"# Quote audit (Law 1)\n\n{total - len(bad)}/{total} quoted strings found verbatim in the "
             f"source material.\n\nNot found:\n" + "".join(f"- {q}\n" for q in bad))
         if total and len(bad) / total > QUOTE_AUDIT_MAX_BAD:
-            (r / "mining-pass-rejected.md").write_text(mining)
+            (r / "mining-pass-rejected.md").write_text(f"{language}\n\n---\n\n{diagnosis}\n")
             raise GateBlocked(f"{len(bad)}/{total} quotes in customer-language.md are not in the source "
                               "material — invented quotes are a defect; see 03_research/quote-audit.md")
-        (r / "customer-language.md").write_text(files["customer-language.md"] + "\n")
-        (r / "market-diagnosis.md").write_text(files["market-diagnosis.md"] + "\n")
-        base = {"customer_language": files["customer-language.md"],
-                "market_diagnosis": files["market-diagnosis.md"], "source_material": raw}
-        cards = (await self.call(seat.persona_cards, base)).output_text
-        n_personas = len(re.findall(rf"(?m)^{PERSONA_HEADING}", cards))
-        if not n_personas:
-            raise StageError("persona-cards output has no '## Persona …' cards")
-        (r / "persona-cards.md").write_text(cards.strip() + "\n")
+        (r / "customer-language.md").write_text(language + "\n")
+        (r / "market-diagnosis.md").write_text(diagnosis + "\n")
+        base = {"customer_language": language, "market_diagnosis": diagnosis, "source_material": raw}
+        persona_data = (await self.call(seat.persona_cards, base)).data
+        personas = persona_data["personas"]
+        if not personas:
+            raise StageError("persona-cards output has no personas")
+        # Written in one canonical shape so persona_card_for / visual_world always find their parts.
+        cards = "\n\n".join(
+            f"## Persona: {p['name'].strip()}\n- Visual world: {p['visual_world'].strip()}\n"
+            f"{p['card_md'].strip()}" for p in personas) + "\n\n" + persona_data["closing_table_md"].strip()
+        (r / "persona-cards.md").write_text(cards + "\n")
         angles = (await self.call(seat.angle_bank, {
-            **base, "persona_cards": cards, "creative_ledger": self._ledger(ctx)})).output_text
-        (ctx.brand_dir / "04_angles-scripts" / "angle-bank.md").write_text(angles.strip() + "\n")
+            **base, "persona_cards": cards, "creative_ledger": self._ledger(ctx)})).data
+        (ctx.brand_dir / "04_angles-scripts" / "angle-bank.md").write_text(angles["angle_bank_md"].strip() + "\n")
         (ctx.brand_dir / "07_results" / "invalidate-research.flag").unlink(missing_ok=True)
         ok, why = gates.research_freshness_gate(ctx.brand_dir)
         if not ok:
             raise GateBlocked(f"research gate still failing after refresh: {why}")
-        return f"customer language, market diagnosis, {n_personas} persona cards, " \
-               f"{len(re.findall(r'(?m)^### A', angles))} angles"
+        return f"customer language, market diagnosis, {len(personas)} persona cards, " \
+               f"{len(angles['angle_ids'])} angles"
 
     # ------------------------------------------------------ Stage 2: pattern mining
     async def stage_patterns(self, ctx: Ctx) -> str:
@@ -324,10 +367,10 @@ class Stages:
         atomic_write(lib_path, header + lib.strip() + "\n")
         sel = (await self.call(scout.swipe_vault, {
             "n_images": len(rows), "teardown_rows": table, "pattern_library": lib,
-            "evidence_per_image": "\n".join(lines.values())})).output_text
-        entries = [o for o in json_objects(sel) if "file" in o and "source_ad_id" in o]
+            "evidence_per_image": "\n".join(lines.values())})).data
+        entries = sel["entries"]
         if not 8 <= len(entries) <= 15:
-            (vault / "selection-rejected.md").write_text(sel)
+            (vault / "selection-rejected.json").write_text(json.dumps(sel, indent=2, ensure_ascii=False))
             raise StageError(f"swipe vault selection has {len(entries)} manifest entries (need 8-15)")
         for e in entries:
             n = re.match(r"(\d+)", e["file"])
@@ -337,7 +380,10 @@ class Stages:
             e["file"] = Path(e["file"]).with_suffix(src.suffix.lower()).name
             shutil.copy2(src, vault / e["file"])
         atomic_write(vault / "manifest.json", json.dumps(entries, indent=2, ensure_ascii=False))
-        (vault / "selection-notes.md").write_text(sel)
+        (vault / "selection-notes.md").write_text(
+            "# Swipe vault selection\n\n## Selected\n"
+            + "".join(f"- {e['file']} — {e['why_it_earned_its_slot']}\n" for e in entries)
+            + "\n## Rejected\n" + sel["rejected_md"].strip() + "\n")
         ok, why = gates.pattern_gate(ctx.root, niche)
         if not ok:
             raise GateBlocked(f"pattern gate still failing after mining: {why}")
@@ -348,14 +394,14 @@ class Stages:
         """One independent visual_teardown call over up to 8 images. Caller gathers these
         concurrently and relies on asyncio.gather's argument-order guarantee to keep rows
         in image order — do not reorder or complete-order-sort the results here."""
-        out = (await self.call(
+        rows = (await self.call(
             scout.visual_teardown,
             {"niche": niche, "evidence_per_image": "\n".join(lines[n] for n in nums)},
-            [(f"image {n}", images[int(n) - 1].read_bytes()) for n in nums])).output_text
-        got = next(iter(parse_tables(out)), [])
-        if len(got) != len(nums):
-            raise StageError(f"teardown returned {len(got)} rows for images {nums[0]}-{nums[-1]}")
-        return got
+            [(f"image {n}", images[int(n) - 1].read_bytes()) for n in nums])).data["rows"]
+        got = {f"{int(m.group()):02d}": r for r in rows if (m := re.search(r"\d+", r["image"]))}
+        if sorted(got) != nums:
+            raise StageError(f"teardown returned rows for images {sorted(got)}, expected {nums}")
+        return [{**got[n], "image": n} for n in nums]
 
     # ------------------------------------------------ Stage 3: concept portfolio
     async def stage_concepts(self, ctx: Ctx) -> str:
@@ -375,16 +421,15 @@ class Stages:
             "angle_bank": ev["angle_bank"], "pattern_library": lib,
             "format_radar": render_table(radar, list(radar[0])) if radar else "none on file",
             "creative_ledger": self._ledger(ctx), "batch": ctx.batch.id[1:]})
-        (ctx.batch.dir / "concepts.md").write_text(res.output_text)
-        tables = parse_tables(res.output_text)
-        rows = max(tables, key=len) if tables else []
+        rows = [concept_row(i, c) for i, c in enumerate(res.data["concepts"], 1)]
+        table = render_table(rows, CONCEPT_COLUMNS)
+        (ctx.batch.dir / "concepts.md").write_text(f"{table}\n\n{res.data['objections_md'].strip()}\n")
         ok, why = gates.portfolio_gate(rows, gates.CONCEPTS_PER_BATCH)
         if not ok:
             raise GateBlocked(f"concept portfolio rejected: {why} (see concepts.md)")
-        for i, row in enumerate(rows, 1):
-            row["#"] = f"{i:02d}"
-            ctx.batch.concepts[f"{i:02d}"] = row
-        (ctx.batch.dir / "concept-table.md").write_text(render_table(rows, list(rows[0])) + "\n")
+        for row in rows:
+            ctx.batch.concepts[row["#"]] = row
+        (ctx.batch.dir / "concept-table.md").write_text(table + "\n")
         ctx.batch.save()
         results = await asyncio.gather(*(self._briefs_for(ctx, c, ev, lib) for c in ctx.batch.concepts))
         return f"{len(rows)} concepts, {sum(results)} briefs ({why.split(', ', 1)[1]})"
@@ -411,8 +456,7 @@ class Stages:
                 res = await self.call(seat.revise_briefs, {**base, "psych_fix": fix, "current_briefs": current})
             else:
                 res = await self.call(seat.write_briefs, base)
-            chunks = [c for c in re.split(r"(?m)^(?=# Creative Brief)", res.output_text)
-                      if c.lstrip().startswith("# Creative Brief")]
+            chunks = [with_copy_slots(b["brief_md"].strip(), b["copy_slots"]) for b in res.data["briefs"]]
             problems = [gates.brief_gate(c)[1] for c in chunks if not gates.brief_gate(c)[0]]
             if len(chunks) == V and not problems:
                 break
@@ -443,27 +487,27 @@ class Stages:
             "landing_page": ctx.profile["landing_page_promise"]}
         seat = self.seat(EcommercePsychologist)
         res = await self.call(seat.psych_review, evidence)  # run() asserts isolation
-        verdicts, prose = extract_json(res.output_text)
-        (ctx.batch.dir / "psych-review.md").write_text(prose + "\n")
-        by = {f"{int(v['concept']):02d}": v for v in verdicts if str(v.get("concept", "")).strip().isdigit()}
+        (ctx.batch.dir / "psych-review.md").write_text(res.data["review_md"].strip() + "\n")
+        by = {f"{v['concept']:02d}": v for v in res.data["verdicts"]}
         absent = [c for c in ctx.batch.concepts if c not in by]
         if absent:
             raise StageError(f"psych review returned no verdict for concepts {absent}")
         lib = read(gates.pattern_library_path(ctx.root, ctx.niche))
         fixes = []
         for cnum, v in by.items():
-            kind = str(v.get("verdict", "")).upper()
-            if kind == "SWAP":
-                ctx.batch.excluded[cnum] = v.get("fix") or "swap requested"
+            if cnum not in ctx.batch.concepts:
+                continue  # a verdict for a concept number that doesn't exist changes nothing
+            if v["verdict"] == "SWAP":
+                ctx.batch.excluded[cnum] = v["fix"] or "swap requested"
                 for nn in [n for n, s in ctx.batch.slots.items() if s["concept"] == cnum]:
                     ctx.batch.slots[nn]["state"] = "excluded"
-            elif kind == "FIX":
-                fixes.append(self._briefs_for(ctx, cnum, ev, lib, fix=v.get("fix") or "apply the review's fix"))
+            elif v["verdict"] == "FIX":
+                fixes.append(self._briefs_for(ctx, cnum, ev, lib, fix=v["fix"] or "apply the review's fix"))
         await asyncio.gather(*fixes)  # the author may see the critic's fix; one pass, no loop
         ctx.batch.save()
         if not any(s["state"] == "open" for s in ctx.batch.slots.values()):
             raise GateBlocked("psych review swapped out every concept; nothing left to produce")
-        tally = {k: sum(1 for v in by.values() if str(v.get("verdict")).upper() == k)
+        tally = {k: sum(1 for c, v in by.items() if c in ctx.batch.concepts and v["verdict"] == k)
                  for k in ("PASS", "FIX", "SWAP")}
         return f"{tally['PASS']} PASS / {tally['FIX']} FIX / {tally['SWAP']} SWAP" + (
             f" — SWAP concepts need replacements: {sorted(ctx.batch.excluded)}" if ctx.batch.excluded else "")
@@ -604,10 +648,12 @@ class Stages:
                     "landing_page_promise": ctx.profile["landing_page_promise"],
                     "exemplar_evidence": ex_ev}
         res = await self.call(self.seat(CreativeDirectorB).judge_and_qa, evidence, images)
-        verdicts, _ = extract_json(res.output_text)
+        verdicts = res.data["verdicts"]
         (ctx.batch.dir / "qa-raw" / f"{cnum}_r{max(ctx.batch.slots[n]['round'] for n in nns)}.md"
-         ).write_text(res.output_text)
-        by = {f"{int(m.group()):02d}": v for v in verdicts if (m := re.search(r"\d+", str(v.get("slot", ""))))}
+         ).write_text(res.data["report_md"].strip() + "\n\n```json\n"
+                      + json.dumps(verdicts, indent=2, ensure_ascii=False) + "\n```\n")
+        # Labels read "slot 03": the slot id's digits identify it.
+        by = {f"{int(m.group()):02d}": v for v in verdicts if (m := re.search(r"\d+", v["slot"]))}
         for nn in nns:
             if nn not in by:
                 raise StageError(f"judge returned no verdict for slot {nn}")
@@ -668,38 +714,37 @@ class Stages:
                  "shipped_copy": self._shipped_copy(ctx), "brand_voice": _or_none(p["brand_voice"], "none"),
                  "batch": ctx.batch.id[1:]}
         writer = self.seat(Copywriter)
-        draft = (await self.call(writer.ad, ad_ev)).output_text
-        (ctx.batch.dir / "copy-draft.md").write_text(draft)
+        draft = (await self.call(writer.ad, ad_ev)).data
+        (ctx.batch.dir / "copy-draft.md").write_text(copy_draft_md(draft))
 
-        def edit_ev(text: str) -> dict:
+        def edit_ev(d: dict) -> dict:
             # The editor gets the draft, never the writer's self-score or rationale.
-            clean = re.split(r"(?im)^.*7-lever self-score.*$", text)[0].strip()
-            return {"draft": clean, "persona_cards": ev["persona_cards"],
+            return {"draft": copy_draft_md(d, self_score=False), "persona_cards": ev["persona_cards"],
                     "customer_language": ev["customer_language"], "market_diagnosis": ev["market_diagnosis"],
                     "feeding_creative": f"{table}\n\nLanding-page promise: {p['landing_page_promise']}",
                     "shipped_copy": ad_ev["shipped_copy"], "brand_voice": ad_ev["brand_voice"]}
 
+        def edit_log(title: str, r: dict) -> str:
+            return (f"## {title}\n{r['edit_report_md'].strip()}\n\nLever scores: {r['lever_scores']} · "
+                    f"hard-gate failures: {r['hard_gate_failures'] or 'none'}\n")
+
         editor = self.seat(CopyEditor)
-        out = (await self.call(editor.edit, edit_ev(draft))).output_text
-        result, prose = extract_json(out)
-        log = [f"## Edit pass 1\n{prose}\n"]
-        if result.get("bounces"):  # Tier 2: bounce to the writer, max ONE round
-            bounces = "\n".join(f"- defect: {b.get('defect')} | evidence line: {b.get('evidence_line')} | "
-                                f"source material: {b.get('source_material')}" for b in result["bounces"])
+        result = (await self.call(editor.edit, edit_ev(draft))).data
+        log = [edit_log("Edit pass 1", result)]
+        if result["bounces"]:  # Tier 2: bounce to the writer, max ONE round
+            bounces = "\n".join(f"- defect: {b['defect']} | evidence line: {b['evidence_line']} | "
+                                f"source material: {b['source_material']}" for b in result["bounces"])
             revised = (await self.call(writer.ad_revision, {**ad_ev, "editor_bounces": bounces,
-                                                              "previous_draft": draft})).output_text
-            out = (await self.call(editor.edit, edit_ev(revised))).output_text
-            result, prose = extract_json(out)
-            log.append(f"## Bounce round (one allowed)\n{bounces}\n\n## Edit pass 2\n{prose}\n")
+                                                              "previous_draft": copy_draft_md(draft)})).data
+            result = (await self.call(editor.edit, edit_ev(revised))).data
+            log.append(f"## Bounce round (one allowed)\n{bounces}\n\n" + edit_log("Edit pass 2", result))
         (ctx.batch.dir / "copy-edit-log.md").write_text("\n".join(log))
         ok, why = gates.copy_gate(result)
         if not ok:
             raise GateBlocked(f"copy does not ship: {why} (see copy-edit-log.md)")
-        table_rows = next((t for t in parse_tables(prose) if t and any("file_1x1" in k.lower() for k in t[0])), [])
-        if not table_rows:
-            raise StageError("edited copy has no copy-sheet table with a file_1x1 column")
-        rows = [{c: {k.lower().strip(): v for k, v in r.items()}.get(c.lower(), "") for c in COPY_COLUMNS}
-                for r in table_rows]
+        rows = sheet_rows(result["rows"])
+        if not rows:
+            raise StageError("the edited copy sheet has no rows")
         issues = gates.copy_lint(rows)
         if issues:
             (ctx.batch.dir / "copy-lint.md").write_text("# Copy lint\n" + "".join(f"- {i}\n" for i in issues))
@@ -707,9 +752,9 @@ class Stages:
                               + " — fix copy-lint.md items, save the sheet as "
                               f"{final.name} and run again")
         final.write_text(rows_to_csv(rows, COPY_COLUMNS))
-        m = re.search(r"(?is)(→\s*Human compliance review.*)$", prose)
+        flags = "".join(f"- {f}\n" for f in result["compliance_flags"]) or "(editor listed no flagged claims)\n"
         (ctx.batch.dir / f"compliance-review-{ctx.batch.id}.md").write_text(
-            (m.group(1) if m else "→ Human compliance review\n\n(editor listed no flagged claims)") + "\n")
+            "→ Human compliance review\n\n" + flags)
         return await self._sweep(ctx, f"{len(rows)} copy rows edited ({why}); ")
 
     async def _sweep(self, ctx: Ctx, prefix: str) -> str:
@@ -722,12 +767,12 @@ class Stages:
             ", ".join(p.get("banned_words") or []) or "none listed", "qualifier": p["offer_qualifier"],
             "market": p["market"], "copy_sheet": (ctx.batch.dir / f"{ctx.batch.id}_COPY-SHEET.csv").read_text()},
             images)
-        data, prose = extract_json(res.output_text)
-        (ctx.batch.dir / "batch-sweep.md").write_text(prose + "\n")
-        checks = data.get("checks", [])
-        failed = [c for c in checks if str(c.get("result")).upper() == "FAIL" and int(c.get("n", 0)) != 10]
-        if len(checks) < 10:
-            raise StageError(f"batch sweep reported {len(checks)} of 10 checks")
+        (ctx.batch.dir / "batch-sweep.md").write_text(res.data["sweep_md"].strip() + "\n")
+        checks = res.data["checks"]
+        failed = [c for c in checks if c["result"] == "FAIL" and c["n"] != 10]
+        reported = {c["n"] for c in checks}
+        if len(reported) < 10:
+            raise StageError(f"batch sweep reported {len(reported)} of 10 checks")
         if failed:
             raise GateBlocked("batch sweep FAILED — the batch does not stage: " + "; ".join(
                 f"#{c['n']} {c.get('detail', '')}" for c in failed[:4]))
@@ -746,9 +791,12 @@ class Stages:
             "derived_targets": derived_targets_text(p.get("economics"), p.get("target_cpa")),
             "account_results": self._results_log(ctx),
             "account_state": "unknown — no live account connection; flag it as unknown"})
-        ok, why = gates.ad_names_gate(res.output_text, ctx.batch.id, list(shipped))
+        names = [a["ad_name"].strip() for a in res.data["ad_names"]]
+        ok, why = gates.ad_names_gate("\n".join(names), ctx.batch.id, list(shipped))
         out = ctx.brand_dir / "06_briefs-out" / f"launch-plan-{ctx.batch.id}.md"
-        out.write_text(res.output_text.strip() + "\n\n> PROPOSAL ONLY — nothing here was applied to any ad account.\n")
+        out.write_text(res.data["plan_md"].strip() + "\n\n## Prescribed ad names (the readout contract)\n"
+                       + "".join(f"- {n}\n" for n in names)
+                       + "\n> PROPOSAL ONLY — nothing here was applied to any ad account.\n")
         if not ok:
             raise GateBlocked(f"launch plan rejected: {why}")
         for f in (ctx.batch.dir / f"{ctx.batch.id}_COPY-SHEET.csv",

@@ -38,8 +38,3 @@ what gets promoted · what the next batch must do differently.
 10. PROMOTIONS — rows for winning-variables.md (with T1 evidence strings, and
 fatigued/retired statuses too) and any cross-brand principle for
 creative-learnings.md. Theory never gets promoted — numbers or nothing.
-
---- ORCHESTRATION: MACHINE-READABLE READOUT ROWS (required) ---
-After your normal output above, append ONE fenced ```json block containing exactly:
-{"ads": [{"date": "YYYY-MM-DD", "ad_name": "", "ad_id": "", "batch": "B01|UNMAPPED", "concept": "", "campaign_type": "", "spend": <number>, "purchases": <number|null>, "cpa": <number|null>, "roas": <number|null>, "ctr": <number|null>, "freq": <number|null>, "verdict": "PROMOTE|SCALE|ITERATE|NO-PROMOTE|KILL|FATIGUE|LEARNING|below floor — no verdict|NOT LAUNCHED", "action_taken": ""}], "winning_variables": [{"variable_type": "", "value": "", "batch": "", "evidence": "<spend, CPA vs target, CTR — numbers or no row>", "tier": "T1", "date": "YYYY-MM-DD", "status": "ACTIVE|fatigued|RETIRED"}], "learnings": ["<cross-brand principle with numbers>"], "invalidate_research": true|false}
-The orchestrator enforces the gates from this block; the prose above stays authoritative for the human reader.

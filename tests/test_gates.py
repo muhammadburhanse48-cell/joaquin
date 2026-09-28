@@ -7,8 +7,7 @@ import pytest
 from orchestrator import economics as ec
 from orchestrator import gates
 from orchestrator.brand_state import Batch, initialize_brand, mark_launched, append_results, append_winning_variables
-from orchestrator.parsing import extract_json, parse_tables, split_named_files, unverified_quotes
-from orchestrator.errors import StageError
+from orchestrator.parsing import parse_tables, unverified_quotes
 
 
 def test_economics_match_the_handbook_worked_example():
@@ -170,13 +169,20 @@ def test_winning_variables_need_t1_numbers(root):
     assert kept == 1
 
 
+def test_structured_copy_slots_are_written_back_into_the_brief_in_the_one_readable_form():
+    from orchestrator.stages import with_copy_slots
+    loose = BRIEF.split("## Copy slots")[0] + "## Copy slots for the image\nsee the image\n## Compliance notes\nnone\n"
+    assert not gates.brief_gate(loose)[0]  # the model's free-form slot block alone is unreadable
+    fixed = with_copy_slots(loose, {"eyebrow": "", "headline": 'The "one less thing" bag',
+                                    "proof": "4.8 stars", "was": "", "now": "$59"})
+    assert gates.brief_gate(fixed)[0]
+    assert gates.copy_slots(fixed) =={"eyebrow": "", "headline": "The 'one less thing' bag",
+                                 "proof": "4.8 stars", "was": "", "now": "$59"}
+    assert fixed.count("## Copy slots") == 1 and "## Compliance notes\nnone" in fixed
+    assert "## Copy slots" in with_copy_slots("# Creative Brief — x\n", {"headline": "h"})
+
+
 def test_parsing_helpers():
-    data, prose = extract_json('text\n```json\n{"a": 1}\n```\n')
-    assert data == {"a": 1} and prose == "text"
-    with pytest.raises(StageError):
-        extract_json("no block")
-    files = split_named_files("# customer-language.md\nAAA\n# market-diagnosis.md\nBBB", ["customer-language.md", "market-diagnosis.md"])
-    assert files == {"customer-language.md": "AAA", "market-diagnosis.md": "BBB"}
     assert parse_tables("| a | b |\n|---|---|\n| 1 | 2 |\n")[0] == [{"a": "1", "b": "2"}]
     bad, total = unverified_quotes('- "I love it so much really"\n- "invented line nobody said"', "I love it so much, really!")
     assert (bad, total) == (["invented line nobody said"], 2)

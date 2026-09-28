@@ -4,7 +4,7 @@ from agents.base_seat import BaseSeat, SeatResult
 
 
 class Copywriter(BaseSeat):
-    max_tokens = 16000
+    max_tokens = 32000
 
     def __init__(self, **kwargs):
         super().__init__("copywriter", **kwargs)

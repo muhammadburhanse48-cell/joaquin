@@ -4,26 +4,28 @@ from pathlib import Path
 import pytest
 
 from agents.base_seat import (BaseSeat, IsolationViolation, MissingEvidence, PROMPTS_ROOT,
-                              assert_isolated_evidence)
+                              SeatOutputError, assert_isolated_evidence)
 from agents.seats.copy_editor import CopyEditor
 from agents.seats.creative_director_b import CreativeDirectorB
 from agents.seats.creative_strategist import CreativeStrategist
 from agents.seats.ecommerce_psychologist import EcommercePsychologist
 from agents.seats.graphic_designer import GraphicDesigner
 from agents.seats.video_editor import VideoEditor, VideoScriptGate
-from tests.fakes import PNG, ScriptedClient
+from agents.schemas import SCHEMAS
+from tests.fakes import PNG, StreamingMixin, response
 
 
-class Echo:
-    """Client that records the request and returns fixed text."""
+class Echo(StreamingMixin):
+    """Client that records the request and returns fixed text ({} for a structured task)."""
 
-    def __init__(self):
+    def __init__(self, stop_reason="end_turn", text=None):
         self.calls, self.messages = [], self
+        self.stop_reason, self.text = stop_reason, text
 
     def create(self, **kw):
-        from types import SimpleNamespace
         self.calls.append(kw)
-        return SimpleNamespace(content=[SimpleNamespace(type="text", text="ok")])
+        text = self.text if self.text is not None else ("{}" if "output_config" in kw else "ok")
+        return response(text, self.stop_reason)
 
 
 def test_request_is_stateless_single_message():
@@ -33,6 +35,63 @@ def test_request_is_stateless_single_message():
     seat.run("again {{brand}}", {"brand": "Demo"})
     assert [len(x["messages"]) for x in c.calls] == [1, 1]
     assert c.calls[1]["messages"][0]["content"][-1]["text"] == "again Demo"  # no carry-over
+
+
+def test_structured_task_sends_its_schema_and_returns_parsed_data():
+    c = Echo(text='{"review_md": "r", "verdicts": [{"concept": 1, "verdict": "PASS", "fix": ""}]}')
+    ev = {k: "x" for k in ("concept_portfolio", "persona_cards", "customer_language",
+                           "market_diagnosis", "results_log", "landing_page")}
+    res = EcommercePsychologist(client=c).psych_review(ev)
+    fmt = c.calls[0]["output_config"]["format"]
+    assert fmt["type"] == "json_schema"
+    assert fmt["schema"] is SCHEMAS[("ecommerce_psychologist", "task_psych_review.md")]
+    assert res.data["verdicts"][0]["verdict"] == "PASS"
+    sent = c.calls[0]["messages"][0]["content"][-1]["text"]
+    assert "OUTPUT FORMAT" in sent and "- verdicts:" in sent  # the model is told where each part goes
+
+
+def test_plain_task_has_no_schema_and_no_data():
+    c = Echo()
+    res = CreativeStrategist(client=c).run("hello {{brand}}", {"brand": "Demo"})
+    assert "output_config" not in c.calls[0] and res.data is None and res.output_text == "ok"
+
+
+@pytest.mark.parametrize("stop,text,match", [
+    ("max_tokens", '{"a": 1', "cut off"),
+    ("refusal", "", "refused"),
+    ("end_turn", "not json", "not JSON"),
+])
+def test_unusable_replies_fail_loudly(stop, text, match):
+    seat = EcommercePsychologist(client=Echo(stop_reason=stop, text=text))
+    with pytest.raises(SeatOutputError, match=match):
+        seat.run("x", {}, schema={"type": "object", "properties": {}, "required": [],
+                                  "additionalProperties": False})
+
+
+def _walk(schema, path="$"):
+    yield path, schema
+    for k, v in schema.get("properties", {}).items():
+        yield from _walk(v, f"{path}.{k}")
+    if "items" in schema:
+        yield from _walk(schema["items"], f"{path}[]")
+    for i, v in enumerate(schema.get("anyOf", [])):
+        yield from _walk(v, f"{path}|{i}")
+
+
+def test_every_schema_is_valid_for_structured_outputs_and_names_a_real_task():
+    unsupported = {"minItems", "maxItems", "minimum", "maximum", "minLength", "maxLength", "multipleOf"}
+    for (seat, task), schema in SCHEMAS.items():
+        assert (PROMPTS_ROOT / seat / task).exists(), (seat, task)
+        for path, node in _walk(schema):
+            assert not unsupported & set(node), (seat, task, path)
+            if node.get("type") == "object":
+                assert node["additionalProperties"] is False, (seat, task, path)
+                assert set(node["required"]) == set(node["properties"]), (seat, task, path)
+
+
+def test_no_prompt_still_asks_for_a_fenced_json_block():
+    for f in PROMPTS_ROOT.rglob("*.md"):
+        assert "```json" not in f.read_text(), f
 
 
 def test_every_prompt_slot_is_a_named_slot_no_raw_paste_tokens():

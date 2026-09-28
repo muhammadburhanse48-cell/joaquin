@@ -30,7 +30,7 @@ from .brand_state import (Batch, RESULTS_COLUMNS, append_learnings, append_resul
 from .economics import derived_targets_text
 from .errors import AlreadyRunning, AwaitingInput, GateBlocked, StageError
 from .imagegen import ImageSource, ManualImageSource
-from .parsing import col, extract_json, parse_tables
+from .parsing import col, parse_tables
 from .stages import CURRENT_STAGE, Ctx, Stages
 
 STAGES = [
@@ -326,7 +326,7 @@ class Pipeline(Stages):
             "economics": econ + "\n\n" + json.dumps(profile.get("economics") or "unknown"),
             "creative_ledger": ledger if "## " in ledger else "nothing shipped yet",
             "results_log": read(brand_dir / "07_results" / "results-log.md")})
-        result, prose = extract_json(res.output_text)
+        result, prose = res.data, res.data["readout_md"].strip()
         ads, notes = gates.enforce_spend_floor(result.get("ads", []), profile.get("target_cpa"))
         launched = [i for i in batch_ids(brand_dir) if Batch.load(brand_dir, i).status == "launched"]
         covered = {str(a.get("batch")) for a in ads}

@@ -5,7 +5,7 @@ from agents.base_seat import BaseSeat, SeatResult
 
 
 class MediaBuyer(BaseSeat):
-    max_tokens = 12000
+    max_tokens = 16000
 
     def __init__(self, **kwargs):
         super().__init__("media_buyer", **kwargs)
