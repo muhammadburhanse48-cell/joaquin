@@ -63,7 +63,12 @@ class MissingEvidence(ValueError):
 
 
 class SeatOutputError(RuntimeError):
-    """The model's reply is unusable: truncated at max_tokens, refused, or not the schema."""
+    """The model's reply is unusable: truncated at max_tokens, refused, or not the schema.
+    raw_text keeps whatever the model did write, so the caller can save it for debugging."""
+
+    def __init__(self, message: str, raw_text: str = ""):
+        super().__init__(message)
+        self.raw_text = raw_text
 
 
 @dataclass
@@ -203,15 +208,15 @@ class BaseSeat:
         )
         stop = getattr(response, "stop_reason", None)
         if stop == "max_tokens":
-            raise SeatOutputError(f"{self.seat_name}: reply was cut off at max_tokens={cap}")
+            raise SeatOutputError(f"{self.seat_name}: reply was cut off at max_tokens={cap}", text)
         if stop == "refusal":
-            raise SeatOutputError(f"{self.seat_name}: the model refused the request")
+            raise SeatOutputError(f"{self.seat_name}: the model refused the request", text)
         data = None
         if schema:
             try:
                 data = json.loads(text)
             except json.JSONDecodeError as exc:
-                raise SeatOutputError(f"{self.seat_name}: structured reply is not JSON: {exc}") from exc
+                raise SeatOutputError(f"{self.seat_name}: structured reply is not JSON: {exc}", text) from exc
         return SeatResult(self.seat_name, text, response, data)
 
     @staticmethod

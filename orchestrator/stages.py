@@ -20,6 +20,7 @@ from datetime import date, timedelta
 from pathlib import Path
 from typing import Any, Callable
 
+from agents.base_seat import SeatOutputError
 from agents.seats.copy_editor import CopyEditor
 from agents.seats.copywriter import Copywriter
 from agents.seats.creative_director_a import CreativeDirectorA
@@ -36,7 +37,8 @@ from .brand_state import (Batch, append_ledger, atomic_write, has_content,
 from .economics import derived_targets_text
 from .errors import AwaitingInput, GateBlocked, StageError
 from .imagegen import IMAGE_SUFFIXES, candidates
-from .parsing import col, parse_tables, render_table, rows_to_csv, unverified_quotes
+from .parsing import (col, match_candidate, parse_tables, render_table, rows_to_csv, slot_id,
+                      unverified_quotes)
 
 COPY_COLUMNS = ["#", "concept", "angle", "persona", "file_1x1", "on_image", "primary_text",
                 "headline", "cta", "link"]
@@ -622,8 +624,14 @@ class Stages:
                     pending.setdefault(s["concept"], []).append(nn)
             if not pending:
                 break
-            await asyncio.gather(*(self._judge_concept(ctx, c, nns, photo) for c, nns in pending.items()))
+            # Every concept runs to the end and saves its own verdicts, so one failed judge call
+            # never throws away (or re-bills on resume) the concepts that were judged fine.
+            results = await asyncio.gather(*(self._judge_concept(ctx, c, nns, photo)
+                                             for c, nns in pending.items()), return_exceptions=True)
             ctx.batch.save()
+            failed = [r for r in results if isinstance(r, BaseException)]
+            if failed:
+                raise failed[0]
         shipped = sum(1 for s in ctx.batch.slots.values() if s["state"] == "shipped")
         escalated = sorted(nn for nn, s in ctx.batch.slots.items() if s["state"] == "escalated")
         if not shipped:
@@ -647,22 +655,31 @@ class Stages:
         evidence = {"persona_card": card, "brand_rules": ctx.brand_rules,
                     "landing_page_promise": ctx.profile["landing_page_promise"],
                     "exemplar_evidence": ex_ev}
-        res = await self.call(self.seat(CreativeDirectorB).judge_and_qa, evidence, images)
+        raw = ctx.batch.dir / "qa-raw" / f"{cnum}_r{max(ctx.batch.slots[n]['round'] for n in nns)}.md"
+        try:
+            res = await self.call(self.seat(CreativeDirectorB).judge_and_qa, evidence, images)
+        except SeatOutputError as exc:  # keep what the model wrote; it is the only debugging trail
+            raw.with_name(raw.stem + "_FAILED.md").write_text(f"<!-- {exc} -->\n\n{exc.raw_text}\n")
+            raise
         verdicts = res.data["verdicts"]
-        (ctx.batch.dir / "qa-raw" / f"{cnum}_r{max(ctx.batch.slots[n]['round'] for n in nns)}.md"
-         ).write_text(res.data["report_md"].strip() + "\n\n```json\n"
-                      + json.dumps(verdicts, indent=2, ensure_ascii=False) + "\n```\n")
-        # Labels read "slot 03": the slot id's digits identify it.
-        by = {f"{int(m.group()):02d}": v for v in verdicts if (m := re.search(r"\d+", v["slot"]))}
+        raw.write_text(res.data["report_md"].strip() + "\n\n```json\n"
+                       + json.dumps(verdicts, indent=2, ensure_ascii=False) + "\n```\n")
+        by: dict[str, dict] = {}
+        for v in verdicts:
+            sid = slot_id(v["slot"])
+            if sid in by:
+                raise StageError(f"judge returned two verdicts for slot {sid} (see {raw.name})")
+            by[sid] = v
         for nn in nns:
             if nn not in by:
-                raise StageError(f"judge returned no verdict for slot {nn}")
+                raise StageError(f"judge returned no verdict for slot {nn} (see {raw.name})")
             self._apply_verdict(ctx, nn, by[nn], labels[nn])
+        ctx.batch.save()
 
     def _apply_verdict(self, ctx: Ctx, nn: str, entry: dict, cands: dict[str, Path]) -> None:
         s = ctx.batch.slots[nn]
         ok, why = gates.qa_gate(entry)  # the code, not the prose, decides SHIP
-        winner = str(entry.get("winner", "")).split("/")[-1].strip()
+        winner = match_candidate(entry.get("winner", ""), list(cands)) or str(entry.get("winner", ""))
         if ok and winner not in cands:
             ok, why = False, f"winner {winner!r} is not one of the candidates {sorted(cands)}"
         scores = entry.get("lever_scores") or []

@@ -7,6 +7,7 @@ import re
 
 import pytest
 
+from agents.base_seat import SeatOutputError
 from orchestrator.brand_state import Batch, mark_launched
 from orchestrator.errors import AlreadyRunning
 from orchestrator.loop import Pipeline
@@ -124,6 +125,37 @@ def test_three_failed_rounds_escalate_to_the_human_and_the_batch_carries_on(root
     assert b.slots["01"]["blocking_issue"] == "handle is wrong"
     assert any("escalated to the human: ['01']" in m for m in msgs)
     assert len(list(b.drive_dir.glob("*_1x1.png"))) == 9
+
+
+def test_judge_formats_for_slot_winner_and_hard_gates_still_ship(root, brand):
+    # Each of these used to be misread: B01-03 as slot 01, "C2.png" as no candidate, "none" as a failure.
+    client = ScriptedClient(psych={}, judge={
+        "03": {"slot": "B01-03", "winner": "C2.png", "hard": ["none"]},
+        "04": {"slot": "B01 slot 04", "winner": "candidate 3", "hard": ["N/A"]}})
+    status, _ = run(Pipeline(root, client=client, image_source=FakeImageSource()))
+    assert status.state == "complete", status.message
+    b = Batch.load(brand, "B01")
+    assert all(b.slots[nn]["state"] == "shipped" and b.slots[nn]["round"] == 1 for nn in ("03", "04"))
+    log = (b.dir / "qa-log.md").read_text()
+    assert "| 1 | 03 | c2 |" in log and "| 1 | 04 | c3 |" in log
+
+
+def test_a_cut_off_judge_reply_is_saved_and_the_other_concepts_are_not_judged_again(root, brand):
+    client = ScriptedClient(psych={}, truncate_judge={"05"})
+    with pytest.raises(SeatOutputError, match="max_tokens"):
+        run(Pipeline(root, client=client, image_source=FakeImageSource()))
+    b = Batch.load(brand, "B01")
+    failed = list((b.dir / "qa-raw").glob("*_FAILED.md"))
+    assert len(failed) == 1 and "Panel scores for slot" in failed[0].read_text()  # the partial reply survives
+    assert b.slots["05"]["state"] == "open"
+    assert sorted(nn for nn, s in b.slots.items() if s["state"] == "shipped") == [
+        f"{n:02d}" for n in range(1, 11) if n != 5]  # every other concept's verdict was saved
+
+    retry = ScriptedClient(psych={})
+    status, _ = run(Pipeline(root, client=retry, image_source=FakeImageSource()))
+    assert status.state == "complete", status.message
+    judged = [c for c in retry.seen("CONTEXT YOU GET")]
+    assert len(judged) == 1 and "[slot 05 / c1]" in json.dumps(judged[0]["messages"])  # only slot 05 re-billed
 
 
 def test_scores_below_eleven_never_ship_even_if_the_judge_says_ship(root, brand):

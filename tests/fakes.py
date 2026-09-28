@@ -38,7 +38,8 @@ class StreamingMixin:
 
 class ScriptedClient(StreamingMixin):
     def __init__(self, judge=None, psych=None, editor_bounce=False, analyst_ads=None, mining_quote=QUOTE_1,
-                 rendezvous: tuple[str, str] | None = None, rendezvous_timeout: float = 5.0):
+                 rendezvous: tuple[str, str] | None = None, rendezvous_timeout: float = 5.0,
+                 truncate_judge: set[str] | frozenset = frozenset()):
         """rendezvous: two prompt-substrings. A call whose prompt contains either one blocks on
         a two-party threading.Barrier until the OTHER one also arrives — deterministic proof
         that two calls are genuinely in flight at once (no sleeps, no timing thresholds; if
@@ -46,6 +47,7 @@ class ScriptedClient(StreamingMixin):
         self.calls: list[dict] = []
         self.messages = self
         self.judge, self.psych = judge, psych
+        self.truncate_judge = set(truncate_judge)  # slots whose judge reply is cut off at max_tokens
         self.editor_bounce, self.analyst_ads, self.mining_quote = editor_bounce, analyst_ads, mining_quote
         self._editor_calls = 0
         # create() runs on real OS threads (Stages.call -> asyncio.to_thread) whenever the
@@ -65,6 +67,9 @@ class ScriptedClient(StreamingMixin):
             self.threads_used.add(threading.get_ident())
         if self._barrier is not None and any(needle in text for needle in self._rendezvous):
             self._barrier.wait()  # blocks here, outside the lock, so the other side can arrive
+        if "CONTEXT YOU GET" in text and any(lab.startswith(f"[slot {s} /") for s in self.truncate_judge
+                                             for lab in labels):
+            return response('{"report_md": "Panel scores for slot', stop_reason="max_tokens")
         reply = self.reply(text, labels)
         structured = "output_config" in kwargs
         if structured != isinstance(reply, dict):
@@ -169,7 +174,7 @@ class ScriptedClient(StreamingMixin):
             spec = (self.judge or {}).get(s, {})
             if isinstance(spec, list):  # one entry per round; the last repeats
                 spec = spec.pop(0) if len(spec) > 1 else spec[0]
-            out.append({"slot": s, "winner": spec.get("winner", "c1"), "verdict": spec.get("verdict", "SHIP"),
+            out.append({"slot": spec.get("slot", s), "winner": spec.get("winner", "c1"), "verdict": spec.get("verdict", "SHIP"),
                         "lever_scores": spec.get("scores", [2, 2, 2, 2, 2, 1, 2]),
                         "hard_gate_failures": spec.get("hard", []), "fix": spec.get("fix", ""),
                         "fix_type": "regenerate" if spec.get("fix") else ""})

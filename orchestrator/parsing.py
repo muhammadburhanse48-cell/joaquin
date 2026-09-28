@@ -58,7 +58,30 @@ def rows_to_csv(rows: list[dict], columns: list[str]) -> str:
     return buf.getvalue()
 
 
-_QUOTE = re.compile(r'["“]([^"”\n]{12,300})["”]')
+def slot_id(raw: str) -> str | None:
+    """Two-digit slot id from a judge's slot field. Images are labelled "slot 03 / c2", but the
+    model also writes "03", "Slot 3", "B01-03" or "B01 slot 03" — the batch number must never
+    be read as the slot, and the candidate number never either."""
+    s = str(raw)
+    m = re.search(r"(?i)slot\s*#?\s*(\d+)", s)
+    if not m:
+        s = re.sub(r"(?i)\b[bc]\d+\b", "", s.split("/")[0])  # drop the batch id and any candidate
+        m = re.search(r"(\d+)\D*$", s)
+    return f"{int(m.group(1)):02d}" if m else None
+
+
+def match_candidate(raw: str, stems: list[str]) -> str | None:
+    """The candidate stem a judge named as winner, or None. Accepts "c2", "C2", "c2.png",
+    "slot 03 / c2", "candidate 2", "#2" for the stem "c2"."""
+    name = re.sub(r"(?i)\.(png|jpe?g|webp)$", "", str(raw).split("/")[-1].strip()).lower()
+    by_lower = {s.lower(): s for s in stems}
+    if name in by_lower:
+        return by_lower[name]
+    m = re.fullmatch(r"(?:candidate|cand|c)?\s*#?\s*(\d+)", name)
+    return by_lower.get(f"c{int(m.group(1))}") if m else None
+
+
+_QUOTE =re.compile(r'["“]([^"”\n]{12,300})["”]')
 
 
 def _norm(s: str) -> str:
